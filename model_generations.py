@@ -19,7 +19,7 @@ CSV_PATH = "data/ukr_test.csv"
 
 MODELS = [
     "google/gemma-4-31B-it",
-    "Qwen/Qwen3-27B",
+    "Qwen/Qwen3.6-27B",
     "meta-llama/Llama-3.3-70B-Instruct",
     "swiss-ai/Apertus-70B-Instruct-2509",
 ]
@@ -39,27 +39,24 @@ def load_dataset(csv_path: str) -> pd.DataFrame:
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
-def build_prompt(question: str) -> str:
-    """Wrap a question in a minimal zero-shot prompt."""
-    return (
-        "Answer the following question as briefly as possible. "
-        "Give only the answer, no explanation.\n\n"
-        f"Question: {question}\nAnswer:"
-    )
-
-
 def query_model(client: InferenceClient, model: str, question: str) -> str:
-    """Call the HF Inference API and return the generated answer."""
-    prompt = build_prompt(question)
+    """Call the HF chat completion API and return the generated answer."""
     try:
-        response = client.text_generation(
-            prompt,
+        response = client.chat.completions.create(
             model=model,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,
-            stop_sequences=["\n", "<|end|>", "<|eot_id|>"],
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Answer the following question as briefly as possible. "
+                        "Give only the answer, no explanation."
+                    ),
+                },
+                {"role": "user", "content": question},
+            ],
+            max_tokens=MAX_NEW_TOKENS,
         )
-        return response.strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"    [WARN] {model} failed for question '{question[:40]}…': {e}")
         return ""
