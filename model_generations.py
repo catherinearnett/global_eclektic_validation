@@ -32,11 +32,7 @@ MAX_NEW_TOKENS = 50
 
 # ── Load dataset ──────────────────────────────────────────────────────────────
 def load_dataset(csv_path: str) -> pd.DataFrame:
-    import chardet
     with open(csv_path, "rb") as f:
-        detected = chardet.detect(f.read())
-    encoding = detected["encoding"]
-    print(f"  Detected encoding: {encoding}")
     print(f"Loading dataset from {csv_path} …")
     df = pd.read_csv(csv_path, encoding='utf-8')
     df = df[df["Question"].notna() & df["Answer"].notna()].reset_index(drop=True)
