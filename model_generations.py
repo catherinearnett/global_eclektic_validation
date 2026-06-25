@@ -83,7 +83,9 @@ def query_model(tokenizer, model, question: str) -> str:
         return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
     except Exception as e:
-        print(f"    [WARN] Failed: {e}")
+        import traceback
+        print(f"    [WARN] Failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
         return ""
 
 
