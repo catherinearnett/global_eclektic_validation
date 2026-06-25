@@ -6,9 +6,10 @@ Requirements:
     pip install huggingface_hub pandas
 
 Usage:
-    python3 model_generations.py
+    HF_TOKEN=your_token python3 model_generations.py
 """
 
+import os
 import re
 import pandas as pd
 from huggingface_hub import InferenceClient
@@ -18,11 +19,13 @@ CSV_PATH = "data/ukr_test.csv"
 
 MODELS = [
     "google/gemma-4-31B-it",
-    "Qwen/Qwen3.6-27B",           
+    "Qwen/Qwen3-27B",
+    "meta-llama/Llama-3.3-70B-Instruct",
     "swiss-ai/Apertus-70B-Instruct-2509",
 ]
 
 MAX_NEW_TOKENS = 50
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 
 # ── Load dataset ──────────────────────────────────────────────────────────────
@@ -30,7 +33,6 @@ def load_dataset(csv_path: str) -> pd.DataFrame:
     """Load the QA dataset from a local CSV file."""
     print(f"Loading dataset from {csv_path} …")
     df = pd.read_csv(csv_path)
-    # Keep only rows where both Question and Answer are present
     df = df[df["Question"].notna() & df["Answer"].notna()].reset_index(drop=True)
     print(f"  Loaded {len(df)} rows.\n")
     return df
@@ -67,8 +69,8 @@ def query_model(client: InferenceClient, model: str, question: str) -> str:
 def normalize(text: str) -> str:
     """Lower-case, strip punctuation/whitespace for lenient exact match."""
     text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)   # remove punctuation
-    return " ".join(text.split())         # collapse whitespace
+    text = re.sub(r"[^\w\s]", "", text)
+    return " ".join(text.split())
 
 
 def exact_match(prediction: str, gold: str) -> int:
@@ -78,9 +80,15 @@ def exact_match(prediction: str, gold: str) -> int:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    if not HF_TOKEN:
+        raise SystemExit(
+            "[ERROR] HF_TOKEN environment variable not set.\n"
+            "Export it before running:  export HF_TOKEN=hf_..."
+        )
+
     df = load_dataset(CSV_PATH)
 
-    client = InferenceClient()  # uses free serverless Inference API (no token needed)
+    client = InferenceClient(token=HF_TOKEN)
 
     results = df[["Question", "Answer"]].copy()
 
