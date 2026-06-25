@@ -30,7 +30,7 @@ MAX_NEW_TOKENS = 50
 # ── Load dataset ──────────────────────────────────────────────────────────────
 def load_dataset(csv_path: str) -> pd.DataFrame:
     print(f"Loading dataset from {csv_path} …")
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, encoding="utf-8-sig")
     df = df[df["Question"].notna() & df["Answer"].notna()].reset_index(drop=True)
     print(f"  Loaded {len(df)} rows.\n")
     return df
@@ -51,7 +51,7 @@ def load_model(model_id: str):
     return tokenizer, model
 
 
-def query_model(tokenizer, model, question: str) -> str:
+def query_model(tokenizer, model, question: str, model_id: str = "") -> str:
     messages = [
         {
             "role": "system",
@@ -63,11 +63,16 @@ def query_model(tokenizer, model, question: str) -> str:
         {"role": "user", "content": question},
     ]
 
+    # Qwen3 has thinking mode on by default — disable it
+    is_qwen3 = "Qwen3" in model_id or "Qwen3" in type(tokenizer).__name__
+    template_kwargs = {"enable_thinking": False} if is_qwen3 else {}
+
     try:
         text = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
             tokenize=False,
+            **template_kwargs,
         )
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
         input_len = inputs["input_ids"].shape[-1]
@@ -122,9 +127,19 @@ def main():
         for i, row in df.iterrows():
             question = row["Question"]
             print(f"  [{i+1}/{len(df)}] {question[:60]}")
-            gen = query_model(tokenizer, model, question)
+            gen = query_model(tokenizer, model, question, model_id)
             print(f"         → {gen[:60]}")
             generations.append(gen)
+
+            # Save incrementally every 10 questions
+            if (i + 1) % 10 == 0:
+                results[gen_col] = generations + [""] * (len(df) - len(generations))
+                results[em_col]  = [
+                    exact_match(g, gold)
+                    for g, gold in zip(generations, df["Answer"])
+                ] + [None] * (len(df) - len(generations))
+                results.to_csv("model_generations_results.csv", index=False, encoding="utf-8-sig")
+                print(f"    [checkpoint] saved after {i+1} questions")
 
         results[gen_col] = generations
         results[em_col]  = [
@@ -134,6 +149,8 @@ def main():
 
         avg_em = results[em_col].mean()
         print(f"\n  → Exact Match for {safe_name}: {avg_em:.2%}")
+        results.to_csv("model_generations_results.csv", index=False, encoding="utf-8-sig")
+        print(f"  [saved] {safe_name} complete")
 
         # Free GPU memory before loading next model
         del model, tokenizer
@@ -141,14 +158,19 @@ def main():
 
     # ── Summary row ──────────────────────────────────────────────────────────
     em_cols = [c for c in results.columns if c.startswith("em_")]
+
+    # Cast EM columns to int before summary row
+    for col in em_cols:
+        results[col] = results[col].astype(int)
+
     summary = {"Question": "** MEAN EM **", "Answer": ""}
     for col in em_cols:
-        summary[col] = results[col].mean()
+        summary[col] = round(results[col].mean(), 4)
     results = pd.concat([results, pd.DataFrame([summary])], ignore_index=True)
 
     # ── Save ─────────────────────────────────────────────────────────────────
     out_path = "model_generations_results.csv"
-    results.to_csv(out_path, index=False)
+    results.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\nResults saved to {out_path}")
     print(results.to_string(max_colwidth=50))
     return results
