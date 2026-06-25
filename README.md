@@ -3,7 +3,7 @@
 ```
 uv venv eclektic
 source eclektic/bin/activate
-uv pip install huggingface_hub pandas
+uv pip install torch transformers accelerate pandas huggingface_hub
 ``` 
 
 ```
