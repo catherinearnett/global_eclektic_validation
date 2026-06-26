@@ -68,6 +68,14 @@ print(f"    Min spread:  {top100['spread'].min():.4f}")
 print(f"    Mean spread: {top100['spread'].mean():.4f}")
 print(f"    Questions with ≥1 correct: {top100['any_correct'].sum()}")
 
+# ── Per-model average scores ─────────────────────────────────────────────────
+print(f"
+  Per-model exact match on top 100:")
+for col in em_cols:
+    model_name = col.replace("em_", "")
+    avg = top100[col].mean()
+    print(f"    {model_name}: {avg:.2%}")
+
 # ── Save and upload ───────────────────────────────────────────────────────────
 out_cols = ["Question", "Answer"] + em_cols + ["total_correct", "spread"]
 out_path = "top100_questions.csv"
