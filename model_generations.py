@@ -171,11 +171,27 @@ def main():
         summary[col] = round(results[col].mean(), 4)
     results = pd.concat([results, pd.DataFrame([summary])], ignore_index=True)
 
-    # ── Save ─────────────────────────────────────────────────────────────────
+    # ── Save locally ─────────────────────────────────────────────────────────
     out_path = "model_generations_results.csv"
     results.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\nResults saved to {out_path}")
     print(results.to_string(max_colwidth=50))
+
+    # ── Upload to HuggingFace dataset repo ───────────────────────────────────
+    hf_upload_token = os.environ.get("HF_TOKEN_UPLOAD")
+    if hf_upload_token:
+        from huggingface_hub import HfApi
+        api = HfApi(token=hf_upload_token)
+        api.upload_file(
+            path_or_fileobj=out_path,
+            path_in_repo="model_generations_results.csv",
+            repo_id="mrlbenchmarks/validation",
+            repo_type="dataset",
+        )
+        print("Uploaded to hf.co/datasets/mrlbenchmarks/validation")
+    else:
+        print("[SKIP] HF_TOKEN_UPLOAD not set, skipping upload.")
+
     return results
 
 
