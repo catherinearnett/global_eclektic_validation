@@ -11,8 +11,12 @@ uv pip install torch transformers accelerate pandas huggingface_hub vllm
 git clone https://github.com/catherinearnett/global_eclektic_validation.git
 cd global_eclektic_validation
 ```
+```
+export HF_TOKEN_READ
+export HF_TOKEN_WRITE
+export HF_TOKEN_UPLOAD
+```
 
-export hf token
 ```
 python3 model_generations.py
 python3 sample_dataset.py
