@@ -2,6 +2,10 @@
 Generate answers from multiple models locally on GPU using transformers,
 and evaluate using exact match scoring.
 
+Each model is queried twice per row:
+  - "orig": the original-language question  (Question -> Answer)
+  - "en":   the English translation          (Question Corrected Translation -> Answer Corrected Translation)
+
 Requirements:
     pip install transformers accelerate pandas torch
 
@@ -11,14 +15,14 @@ Usage:
 
 import re
 import os
-import sys
 os.environ["PYTHONIOENCODING"] = "utf-8"
 import pandas as pd
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CSV_PATH = "data/ukr_test.csv"
+CSV_PATH = "global_eclektic_unfiltered/Ukrainian - Questions.csv"
+OUT_PATH = "model_generations_results.csv"
 
 MODELS = [
     "google/gemma-4-31B-it",
@@ -27,15 +31,91 @@ MODELS = [
     "swiss-ai/Apertus-70B-Instruct-2509",
 ]
 
-MAX_NEW_TOKENS = 50
+MAX_NEW_TOKENS = 100
+
+# Columns to keep, in this order
+KEEP_COLUMNS = [
+    "ID",
+    "Author",
+    "Checked By",
+    "Language",
+    "Country/Region",
+    "Question",
+    "Answer",
+    "Evidence_url",
+    "Question Automatic Translation",
+    "Question Corrected Translation",
+    "Answer Automatic Translation",
+    "Answer Corrected Translation",
+    "Translation Corrected By",
+    "Notes",
+    "URL language (if different from target language)",
+    "Exclude",
+]
+
+# (automatic, corrected) translation column pairs
+TRANSLATION_PAIRS = [
+    ("Question Automatic Translation", "Question Corrected Translation"),
+    ("Answer Automatic Translation", "Answer Corrected Translation"),
+]
+
+# Question/answer variants to evaluate: name -> (question column, gold answer column)
+VARIANTS = {
+    "orig": ("Question", "Answer"),
+    "en": ("Question Corrected Translation", "Answer Corrected Translation"),
+}
 
 
 # ── Load dataset ──────────────────────────────────────────────────────────────
 def load_dataset(csv_path: str) -> pd.DataFrame:
     print(f"Loading dataset from {csv_path} …")
-    df = pd.read_csv(csv_path, encoding='utf-8')
-    df = df[df["Question"].notna() & df["Answer"].notna()].reset_index(drop=True)
-    print(f"  Loaded {len(df)} rows.\n")
+    df = pd.read_csv(csv_path, encoding="utf-8", dtype=str)
+    df.columns = df.columns.str.strip()
+    print(f"  Loaded {len(df)} raw rows.\n")
+    return df
+
+
+# ── Filter dataset ────────────────────────────────────────────────────────────
+def _is_blank(series: pd.Series) -> pd.Series:
+    """True where a cell is NaN or only whitespace."""
+    return series.isna() | series.astype(str).str.strip().eq("")
+
+
+def filter_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    missing = [c for c in KEEP_COLUMNS if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing expected columns: {missing}")
+
+    # Keep only the expected columns, in the expected order
+    df = df[KEEP_COLUMNS].copy()
+    df = df.apply(lambda s: s.str.strip())
+    n_start = len(df)
+
+    # Drop any row with a value in Exclude, then drop the column
+    excluded = ~_is_blank(df["Exclude"])
+    df = df[~excluded].drop(columns="Exclude")
+    print(f"  Removed {excluded.sum()} excluded rows.")
+
+    # Fill empty corrected translations from the automatic translation
+    for auto_col, corr_col in TRANSLATION_PAIRS:
+        fill = _is_blank(df[corr_col])
+        df.loc[fill, corr_col] = df.loc[fill, auto_col]
+        print(f"  Filled {fill.sum()} empty '{corr_col}' from '{auto_col}'.")
+
+    # Drop rows still missing a translation (no automatic AND no corrected)
+    no_translation = pd.Series(False, index=df.index)
+    for _, corr_col in TRANSLATION_PAIRS:
+        no_translation |= _is_blank(df[corr_col])
+    df = df[~no_translation]
+    print(f"  Removed {no_translation.sum()} rows with no translation.")
+
+    # Drop rows missing the original question or answer
+    no_original = _is_blank(df["Question"]) | _is_blank(df["Answer"])
+    df = df[~no_original]
+    print(f"  Removed {no_original.sum()} rows with no original question/answer.")
+
+    df = df.reset_index(drop=True)
+    print(f"  Kept {len(df)} of {n_start} rows.\n")
     return df
 
 
@@ -110,15 +190,28 @@ def exact_match(prediction: str, gold: str) -> int:
     return int(normalize(prediction) == normalize(gold))
 
 
+def write_model_columns(results: pd.DataFrame, df: pd.DataFrame,
+                        safe_name: str, generations: dict) -> None:
+    """Write gen/em columns for every variant, padding rows not yet generated."""
+    n = len(df)
+    for variant, (_, answer_col) in VARIANTS.items():
+        gens = generations[variant]
+        pad = n - len(gens)
+        results[f"gen_{safe_name}_{variant}"] = gens + [""] * pad
+        results[f"em_{safe_name}_{variant}"] = [
+            exact_match(g, gold) for g, gold in zip(gens, df[answer_col])
+        ] + [None] * pad
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    df = load_dataset(CSV_PATH)
-    results = df[["Question", "Answer"]].copy()
+    df = filter_dataset(load_dataset(CSV_PATH))
+    results = df[["ID", "Question", "Answer",
+                  "Question Corrected Translation",
+                  "Answer Corrected Translation"]].copy()
 
     for model_id in MODELS:
         safe_name = model_id.split("/")[-1]
-        gen_col   = f"gen_{safe_name}"
-        em_col    = f"em_{safe_name}"
 
         print(f"\n{'='*60}")
         print(f"Querying {model_id} …")
@@ -126,33 +219,26 @@ def main():
 
         tokenizer, model = load_model(model_id)
 
-        generations = []
+        generations = {variant: [] for variant in VARIANTS}
         for i, row in df.iterrows():
-            question = row["Question"]
-            print(f"  [{i+1}/{len(df)}] {question[:60]}")
-            gen = query_model(tokenizer, model, question, model_id)
-            print(f"         → {gen[:60]}")
-            generations.append(gen)
+            for variant, (question_col, _) in VARIANTS.items():
+                question = row[question_col]
+                print(f"  [{i+1}/{len(df)}][{variant}] {question[:60]}")
+                gen = query_model(tokenizer, model, question, model_id)
+                print(f"         → {gen[:60]}")
+                generations[variant].append(gen)
 
-            # Save incrementally every 10 questions
+            # Save incrementally every 10 rows
             if (i + 1) % 10 == 0:
-                results[gen_col] = generations + [""] * (len(df) - len(generations))
-                results[em_col]  = [
-                    exact_match(g, gold)
-                    for g, gold in zip(generations, df["Answer"])
-                ] + [None] * (len(df) - len(generations))
-                results.to_csv("model_generations_results.csv", index=False, encoding="utf-8-sig")
-                print(f"    [checkpoint] saved after {i+1} questions")
+                write_model_columns(results, df, safe_name, generations)
+                results.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
+                print(f"    [checkpoint] saved after {i+1} rows")
 
-        results[gen_col] = generations
-        results[em_col]  = [
-            exact_match(gen, gold)
-            for gen, gold in zip(generations, df["Answer"])
-        ]
-
-        avg_em = results[em_col].mean()
-        print(f"\n  → Exact Match for {safe_name}: {avg_em:.2%}")
-        results.to_csv("model_generations_results.csv", index=False, encoding="utf-8-sig")
+        write_model_columns(results, df, safe_name, generations)
+        for variant in VARIANTS:
+            avg_em = results[f"em_{safe_name}_{variant}"].mean()
+            print(f"\n  → Exact Match for {safe_name} [{variant}]: {avg_em:.2%}")
+        results.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
         print(f"  [saved] {safe_name} complete")
 
         # Free GPU memory before loading next model
@@ -166,15 +252,14 @@ def main():
     for col in em_cols:
         results[col] = results[col].astype(int)
 
-    summary = {"Question": "** MEAN EM **", "Answer": ""}
+    summary = {"ID": "", "Question": "** MEAN EM **", "Answer": ""}
     for col in em_cols:
         summary[col] = round(results[col].mean(), 4)
     results = pd.concat([results, pd.DataFrame([summary])], ignore_index=True)
 
     # ── Save locally ─────────────────────────────────────────────────────────
-    out_path = "model_generations_results.csv"
-    results.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"\nResults saved to {out_path}")
+    results.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
+    print(f"\nResults saved to {OUT_PATH}")
     print(results.to_string(max_colwidth=50))
 
     # ── Upload to HuggingFace dataset repo ───────────────────────────────────
@@ -183,7 +268,7 @@ def main():
         from huggingface_hub import HfApi
         api = HfApi(token=hf_upload_token)
         api.upload_file(
-            path_or_fileobj=out_path,
+            path_or_fileobj=OUT_PATH,
             path_in_repo="model_generations_results.csv",
             repo_id="mrlbenchmarks/validation",
             repo_type="dataset",
