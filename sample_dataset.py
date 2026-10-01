@@ -42,6 +42,8 @@ KEEP_COLUMNS = [
     "Answer Corrected Translation",
     "URL language (if different from target language)",
 ]
+# Note: "Exclude" is not listed here; model_generations.py removes excluded
+# rows and drops that column before writing the results file.
 
 if not TOKEN:
     raise SystemExit("[ERROR] HF_TOKEN_MRL_READ environment variable not set.")
