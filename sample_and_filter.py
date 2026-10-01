@@ -8,7 +8,8 @@ Steps:
             Uses vLLM; models run in parallel on separate GPUs.
             -> results/<language>.csv
   select    Per language, keep the top 100 questions by spread in the original-language
-            scores across models.
+            scores across models. The translation pairs become "Question Translation" and
+            "Answer Translation" (corrected if available, otherwise automatic).
             -> top100/<language>.csv
   upload    Push results/ and top100/ to mrlbenchmarks/global_eclektic as two subsets
             ("generations", the default, and "top100"), one split per language.
@@ -124,6 +125,10 @@ TOP_N = 100
 SAMPLE_VARIANT = "orig"    # which variant drives the selection: "orig" or "en"
 
 SUMMARY_LABEL = "** MEAN EM **"
+
+# In the top100 files, each translation pair becomes one column (same order as
+# TRANSLATION_PAIRS): the corrected translation, or the automatic one if there's none
+TOP100_TRANSLATION_COLUMNS = ["Question Translation", "Answer Translation"]
 
 README_BODY = """# Global ECLeKTic
 
@@ -633,7 +638,22 @@ def select_top(df: pd.DataFrame, lang: str) -> pd.DataFrame:
     out_cols = dataset_cols + gen_cols + em_cols_all + [
         f"total_correct_{v}" for v in VARIANTS
     ] + ["spread"]
-    return top[out_cols]
+    return merge_translations(top[out_cols])
+
+
+def merge_translations(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace each automatic/corrected translation pair with a single column:
+    the corrected translation if there is one, otherwise the automatic one."""
+    df = df.copy()
+    for (auto_col, corr_col), new_col in zip(TRANSLATION_PAIRS, TOP100_TRANSLATION_COLUMNS):
+        corrected = df[corr_col] if corr_col in df else pd.Series(pd.NA, index=df.index)
+        automatic = df[auto_col] if auto_col in df else pd.Series(pd.NA, index=df.index)
+        merged = corrected.where(~_is_blank(corrected), automatic)
+        present = [c for c in (auto_col, corr_col) if c in df]
+        position = min(df.columns.get_loc(c) for c in present) if present else len(df.columns)
+        df = df.drop(columns=present)
+        df.insert(position, new_col, merged)
+    return df
 
 
 def step_select(args, files: set) -> None:
