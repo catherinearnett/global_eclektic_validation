@@ -15,4 +15,5 @@ export hf token
 ```
 python3 model_generations.py
 python3 sample_dataset.py
+python3 upload.py
 ```
