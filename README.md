@@ -14,4 +14,5 @@ cd global_eclektic_validation
 export hf token
 ```
 python3 model_generations.py
+sample_dataset.py
 ```
