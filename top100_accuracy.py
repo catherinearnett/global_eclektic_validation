@@ -16,10 +16,11 @@ Output:
       language "ALL LANGUAGES"  = mean over languages (each language weighted equally)
 
 Usage:
-    export HF_TOKEN_READ=hf_...                # any token that can read the repo
+    export HF_TOKEN_UPLOAD=hf_...              # any token that can read the repo
+                                               # (HF_TOKEN_UPLOAD, HF_TOKEN_READ or HF_TOKEN_MRL_READ)
     python3 top100_accuracy.py                 # from the HF repo
     python3 top100_accuracy.py --source local  # from top100/
-    python3 top100_accuracy.py --languages ukrainian,german
+    python3 top100_accuracy.py --languages ukr_cyrl,ita_latn
 """
 
 import argparse
@@ -34,27 +35,46 @@ LOCAL_DIR = "top100"
 OUT_PATH  = "top100_accuracy.csv"
 
 VARIANTS = {"orig": "original", "en": "english"}
-READ_TOKEN_VARS = ("HF_TOKEN_READ", "HF_TOKEN_UPLOAD", "HF_TOKEN_MRL_READ")
+READ_TOKEN_VARS = ("HF_TOKEN_UPLOAD", "HF_TOKEN_READ", "HF_TOKEN_MRL_READ")
+_token = None   # the first token that can read the repo, found by list_languages
 
 
 def read_token() -> str:
-    for var in READ_TOKEN_VARS:
-        if os.environ.get(var):
-            return os.environ[var]
+    if _token:
+        return _token
     raise SystemExit(f"[ERROR] No Hugging Face token set ({', '.join(READ_TOKEN_VARS)}).")
 
 
 def list_languages(source: str) -> dict:
     """Map language -> local path or repo filename."""
+    global _token
     if source == "local":
         if not os.path.isdir(LOCAL_DIR):
             raise SystemExit(f"[ERROR] {LOCAL_DIR}/ not found.")
         return {os.path.splitext(f)[0]: os.path.join(LOCAL_DIR, f)
                 for f in sorted(os.listdir(LOCAL_DIR)) if f.endswith(".csv")}
+
     from huggingface_hub import HfApi
-    files = HfApi(token=read_token()).list_repo_files(REPO_ID, repo_type="dataset")
-    return {os.path.splitext(os.path.basename(f))[0]: f
-            for f in sorted(files) if f.startswith(HF_DIR + "/") and f.endswith(".csv")}
+    from huggingface_hub.utils import RepositoryNotFoundError
+
+    tokens = [(var, os.environ[var]) for var in READ_TOKEN_VARS if os.environ.get(var)]
+    if not tokens:
+        raise SystemExit(f"[ERROR] No Hugging Face token set ({', '.join(READ_TOKEN_VARS)}).")
+    for var, token in tokens:   # use the first token that can see the repo
+        try:
+            files = HfApi(token=token).list_repo_files(REPO_ID, repo_type="dataset")
+        except RepositoryNotFoundError:
+            continue
+        _token = token
+        print(f"Reading {REPO_ID} with {var}.")
+        return {os.path.splitext(os.path.basename(f))[0]: f
+                for f in sorted(files) if f.startswith(HF_DIR + "/") and f.endswith(".csv")}
+    raise SystemExit(
+        f"[ERROR] {REPO_ID} was not found with any of: {', '.join(v for v, _ in tokens)}.\n"
+        f"        Either nothing has been uploaded yet (run: python3 global_eclektic.py upload),\n"
+        f"        or none of these tokens has access to the repo.\n"
+        f"        To use local results instead: python3 top100_accuracy.py --source local"
+    )
 
 
 def load(location: str, source: str) -> pd.DataFrame:
