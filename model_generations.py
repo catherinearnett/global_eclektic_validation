@@ -1,41 +1,65 @@
 """
-Generate answers from multiple models locally on GPU using transformers,
+Generate answers from multiple models locally on GPU using vLLM,
 and evaluate using exact match scoring.
 
 Each model is queried twice per row:
   - "orig": the original-language question  (Question -> Answer)
   - "en":   the English translation          (Question Corrected Translation -> Answer Corrected Translation)
 
+Models run in parallel, each in its own process on its own set of GPUs
+(see GPUS_PER_MODEL). When a model finishes, its GPUs are freed and the next
+waiting model starts.
+
 Requirements:
-    pip install transformers accelerate pandas torch
+    pip install vllm pandas
 
 Usage:
-    python3 model_generations.py
+    python3 model_generations.py            # run everything
+    python3 model_generations.py --rerun    # ignore finished per-model results and regenerate
 """
 
-import re
+import argparse
 import os
+import re
+import subprocess
+import sys
+import time
+
 os.environ["PYTHONIOENCODING"] = "utf-8"
 import pandas as pd
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CSV_PATH = "global_eclektic_unfiltered/Ukrainian - Questions.csv"
 OUT_PATH = "model_generations_results.csv"
+WORK_DIR = "work"          # filtered dataset + per-model results
+LOG_DIR  = "logs"          # one log file per model
 
-MODELS = [
-    "google/gemma-4-31B-it",
-    "Qwen/Qwen3.6-27B",
-    "meta-llama/Llama-3.3-70B-Instruct",
-    "swiss-ai/Apertus-70B-Instruct-2509",
-]
+# Model -> number of GPUs (tensor parallel size).
+# Must be a power of 2 that divides the model's attention heads (1, 2, 4, 8).
+GPUS_PER_MODEL = {
+    "google/gemma-4-31B-it":              2,
+    "Qwen/Qwen3.6-27B":                   2,
+    "meta-llama/Llama-3.3-70B-Instruct":  4,
+    "swiss-ai/Apertus-70B-Instruct-2509": 4,
+}
+MODELS = list(GPUS_PER_MODEL)
 
-MAX_NEW_TOKENS = 100
+TOTAL_GPUS = None          # None = detect automatically
+
+MAX_NEW_TOKENS = 50
+MAX_MODEL_LEN  = 4096      # prompts are short; a small context leaves more memory for batching
+GPU_MEM_UTIL   = 0.90
+
+SYSTEM_PROMPT = (
+    "Answer the following question as briefly as possible. "
+    "Give only the answer, no explanation."
+)
 
 # Columns to keep, in this order
 KEEP_COLUMNS = [
     "ID",
+    "Author",
+    "Checked By",
     "Language",
     "Country/Region",
     "Question",
@@ -45,6 +69,8 @@ KEEP_COLUMNS = [
     "Question Corrected Translation",
     "Answer Automatic Translation",
     "Answer Corrected Translation",
+    "Translation Corrected By",
+    "Notes",
     "URL language (if different from target language)",
     "Exclude",
 ]
@@ -60,6 +86,16 @@ VARIANTS = {
     "orig": ("Question", "Answer"),
     "en": ("Question Corrected Translation", "Answer Corrected Translation"),
 }
+
+FILTERED_PATH = os.path.join(WORK_DIR, "filtered_dataset.csv")
+
+
+def safe_name(model_id: str) -> str:
+    return model_id.split("/")[-1]
+
+
+def model_result_path(model_id: str) -> str:
+    return os.path.join(WORK_DIR, f"gen_{safe_name(model_id)}.csv")
 
 
 # ── Load dataset ──────────────────────────────────────────────────────────────
@@ -115,64 +151,8 @@ def filter_dataset(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ── Inference ─────────────────────────────────────────────────────────────────
-def load_model(model_id: str):
-    print(f"  Loading tokenizer …")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-    print(f"  Loading model across GPUs …")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",        # spreads across all available GPUs
-    )
-    model.eval()
-    return tokenizer, model
-
-
-def query_model(tokenizer, model, question: str, model_id: str = "") -> str:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Answer the following question as briefly as possible. "
-                "Give only the answer, no explanation."
-            ),
-        },
-        {"role": "user", "content": question},
-    ]
-
-    # Qwen3 has thinking mode on by default — disable it
-    is_qwen3 = "Qwen3" in model_id or "Qwen3" in type(tokenizer).__name__
-    template_kwargs = {"enable_thinking": False} if is_qwen3 else {}
-
-    try:
-        text = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=False,
-            **template_kwargs,
-        )
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-        input_len = inputs["input_ids"].shape[-1]
-
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-
-        # Decode only the newly generated tokens
-        new_tokens = output_ids[0][input_len:]
-        return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-    except Exception as e:
-        import traceback
-        print(f"    [WARN] Failed: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        return ""
+def read_filtered() -> pd.DataFrame:
+    return pd.read_csv(FILTERED_PATH, encoding="utf-8", dtype=str, keep_default_na=False)
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
@@ -186,77 +166,206 @@ def exact_match(prediction: str, gold: str) -> int:
     return int(normalize(prediction) == normalize(gold))
 
 
-def write_model_columns(results: pd.DataFrame, df: pd.DataFrame,
-                        safe_name: str, generations: dict) -> None:
-    """Write gen/em columns for every variant, padding rows not yet generated."""
-    n = len(df)
+# ── Worker: one model, run in its own process on its own GPUs ────────────────
+def build_prompt_ids(tokenizer, question: str, model_id: str) -> list:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    # Qwen3 has thinking mode on by default — disable it
+    template_kwargs = {"enable_thinking": False} if "Qwen3" in model_id else {}
+    text = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False, **template_kwargs
+    )
+    # The chat template already contains BOS, so don't add special tokens again
+    return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+
+def run_worker(model_id: str, n_gpus: int, out_path: str) -> None:
+    from vllm import LLM, SamplingParams
+
+    df = read_filtered()
+    name = safe_name(model_id)
+    print(f"[{name}] {len(df)} rows, tensor_parallel_size={n_gpus}", flush=True)
+
+    llm = LLM(
+        model=model_id,
+        tensor_parallel_size=n_gpus,
+        dtype="bfloat16",
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=GPU_MEM_UTIL,
+    )
+    tokenizer = llm.get_tokenizer()
+    params = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS)
+
+    # Build every prompt for every variant and generate in a single batched call
+    prompts, keys = [], []
+    for variant, (question_col, _) in VARIANTS.items():
+        for q in df[question_col]:
+            prompts.append({"prompt_token_ids": build_prompt_ids(tokenizer, q, model_id)})
+            keys.append(variant)
+
+    start = time.time()
+    outputs = llm.generate(prompts, params)
+    print(f"[{name}] generated {len(outputs)} answers in {time.time() - start:.0f}s", flush=True)
+
+    gens = {variant: [] for variant in VARIANTS}
+    for variant, out in zip(keys, outputs):
+        gens[variant].append(out.outputs[0].text.strip())
+
+    result = pd.DataFrame({"ID": df["ID"]})
     for variant, (_, answer_col) in VARIANTS.items():
-        gens = generations[variant]
-        pad = n - len(gens)
-        results[f"gen_{safe_name}_{variant}"] = gens + [""] * pad
-        results[f"em_{safe_name}_{variant}"] = [
-            exact_match(g, gold) for g, gold in zip(gens, df[answer_col])
-        ] + [None] * pad
+        result[f"gen_{name}_{variant}"] = gens[variant]
+        result[f"em_{name}_{variant}"] = [
+            exact_match(g, gold) for g, gold in zip(gens[variant], df[answer_col])
+        ]
+        print(f"[{name}] Exact Match [{variant}]: "
+              f"{result[f'em_{name}_{variant}'].mean():.2%}", flush=True)
+
+    tmp_path = out_path + ".tmp"
+    result.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+    os.replace(tmp_path, out_path)   # only appears once complete
+    print(f"[{name}] saved {out_path}", flush=True)
+
+
+# ── Scheduler: run workers in parallel on separate GPUs ──────────────────────
+def detect_gpus() -> int:
+    if TOTAL_GPUS:
+        return TOTAL_GPUS
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        return len([line for line in out.splitlines() if line.strip()])
+    except (OSError, subprocess.CalledProcessError):
+        raise SystemExit("[ERROR] Could not detect GPUs; set TOTAL_GPUS in the config.")
+
+
+def is_done(model_id: str, df: pd.DataFrame) -> bool:
+    """A model is done if its result file exists and matches the current dataset."""
+    path = model_result_path(model_id)
+    if not os.path.exists(path):
+        return False
+    prev = pd.read_csv(path, encoding="utf-8-sig", dtype={"ID": str}, keep_default_na=False)
+    return prev["ID"].tolist() == df["ID"].tolist()
+
+
+def run_all_models(df: pd.DataFrame, rerun: bool) -> list:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    total = detect_gpus()
+    print(f"Detected {total} GPUs.\n")
+
+    pending = []
+    for model_id in MODELS:
+        if GPUS_PER_MODEL[model_id] > total:
+            raise SystemExit(f"[ERROR] {model_id} needs {GPUS_PER_MODEL[model_id]} GPUs, "
+                             f"only {total} available.")
+        if not rerun and is_done(model_id, df):
+            print(f"  [skip] {safe_name(model_id)} already has results "
+                  f"(use --rerun to regenerate)")
+        else:
+            pending.append(model_id)
+
+    free_gpus = list(range(total))
+    running = {}   # model_id -> (Popen, gpu list, log file, start time)
+    failed = []
+
+    while pending or running:
+        # Start every pending model that fits on the free GPUs, in MODELS order
+        for model_id in list(pending):
+            n = GPUS_PER_MODEL[model_id]
+            if n <= len(free_gpus):
+                gpus, free_gpus = free_gpus[:n], free_gpus[n:]
+                log_path = os.path.join(LOG_DIR, f"{safe_name(model_id)}.log")
+                log = open(log_path, "w", encoding="utf-8")
+                env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
+                proc = subprocess.Popen(
+                    [sys.executable, os.path.abspath(__file__),
+                     "--worker", model_id,
+                     "--gpus", str(n),
+                     "--out", model_result_path(model_id)],
+                    env=env, stdout=log, stderr=subprocess.STDOUT,
+                )
+                running[model_id] = (proc, gpus, log, time.time())
+                pending.remove(model_id)
+                print(f"  [start] {safe_name(model_id)} on GPUs {gpus}  (log: {log_path})")
+
+        # Check for finished models and free their GPUs
+        for model_id, (proc, gpus, log, started) in list(running.items()):
+            code = proc.poll()
+            if code is None:
+                continue
+            log.close()
+            free_gpus = sorted(free_gpus + gpus)
+            del running[model_id]
+            mins = (time.time() - started) / 60
+            if code == 0:
+                print(f"  [done]  {safe_name(model_id)} in {mins:.1f} min, freed GPUs {gpus}")
+            else:
+                failed.append(model_id)
+                print(f"  [FAIL]  {safe_name(model_id)} exited with code {code} "
+                      f"after {mins:.1f} min, see {LOG_DIR}/{safe_name(model_id)}.log")
+
+        time.sleep(5)
+
+    return failed
+
+
+# ── Merge per-model results into the final file ───────────────────────────────
+def merge_results(df: pd.DataFrame) -> pd.DataFrame:
+    # Keep every dataset column except Exclude (already applied in filter_dataset)
+    results = df.drop(columns="Exclude", errors="ignore").copy()
+
+    for model_id in MODELS:
+        if not is_done(model_id, df):
+            print(f"  [WARN] No results for {safe_name(model_id)}, left out of the final file.")
+            continue
+        model_df = pd.read_csv(model_result_path(model_id), encoding="utf-8-sig",
+                               dtype={"ID": str}, keep_default_na=False)
+        results = pd.concat([results, model_df.drop(columns="ID")], axis=1)
+
+    em_cols = [c for c in results.columns if c.startswith("em_")]
+    for col in em_cols:
+        results[col] = results[col].astype(int)
+
+    print("\nExact Match per model:")
+    for col in em_cols:
+        print(f"  {col.replace('em_', '')}: {results[col].mean():.2%}")
+
+    # Summary row
+    summary = {"ID": "", "Question": "** MEAN EM **", "Answer": ""}
+    for col in em_cols:
+        summary[col] = round(results[col].mean(), 4)
+    return pd.concat([results, pd.DataFrame([summary])], ignore_index=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rerun", action="store_true",
+                        help="regenerate models that already have results")
+    parser.add_argument("--worker", help=argparse.SUPPRESS)
+    parser.add_argument("--gpus", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--out", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    if args.worker:
+        run_worker(args.worker, args.gpus, args.out)
+        return
+
+    os.makedirs(WORK_DIR, exist_ok=True)
     df = filter_dataset(load_dataset(CSV_PATH))
-    results = df[["ID", "Question", "Answer",
-                  "Question Corrected Translation",
-                  "Answer Corrected Translation"]].copy()
+    df.to_csv(FILTERED_PATH, index=False, encoding="utf-8")
+    df = read_filtered()   # read back so workers and merge see identical data
 
-    for model_id in MODELS:
-        safe_name = model_id.split("/")[-1]
+    failed = run_all_models(df, args.rerun)
+    if failed:
+        print(f"\n[WARN] Failed models: {[safe_name(m) for m in failed]}")
 
-        print(f"\n{'='*60}")
-        print(f"Querying {model_id} …")
-        print(f"{'='*60}")
-
-        tokenizer, model = load_model(model_id)
-
-        generations = {variant: [] for variant in VARIANTS}
-        for i, row in df.iterrows():
-            for variant, (question_col, _) in VARIANTS.items():
-                question = row[question_col]
-                print(f"  [{i+1}/{len(df)}][{variant}] {question[:60]}")
-                gen = query_model(tokenizer, model, question, model_id)
-                print(f"         → {gen[:60]}")
-                generations[variant].append(gen)
-
-            # Save incrementally every 10 rows
-            if (i + 1) % 10 == 0:
-                write_model_columns(results, df, safe_name, generations)
-                results.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
-                print(f"    [checkpoint] saved after {i+1} rows")
-
-        write_model_columns(results, df, safe_name, generations)
-        for variant in VARIANTS:
-            avg_em = results[f"em_{safe_name}_{variant}"].mean()
-            print(f"\n  → Exact Match for {safe_name} [{variant}]: {avg_em:.2%}")
-        results.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
-        print(f"  [saved] {safe_name} complete")
-
-        # Free GPU memory before loading next model
-        del model, tokenizer
-        torch.cuda.empty_cache()
-
-    # ── Summary row ──────────────────────────────────────────────────────────
-    em_cols = [c for c in results.columns if c.startswith("em_")]
-
-    # Cast EM columns to int before summary row
-    for col in em_cols:
-        results[col] = results[col].astype(int)
-
-    summary = {"ID": "", "Question": "** MEAN EM **", "Answer": ""}
-    for col in em_cols:
-        summary[col] = round(results[col].mean(), 4)
-    results = pd.concat([results, pd.DataFrame([summary])], ignore_index=True)
-
-    # ── Save locally ─────────────────────────────────────────────────────────
+    results = merge_results(df)
     results.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
     print(f"\nResults saved to {OUT_PATH}")
-    print(results.to_string(max_colwidth=50))
 
     # ── Upload to HuggingFace dataset repo ───────────────────────────────────
     hf_upload_token = os.environ.get("HF_TOKEN_UPLOAD")
@@ -272,8 +381,6 @@ def main():
         print("Uploaded to hf.co/datasets/mrlbenchmarks/validation")
     else:
         print("[SKIP] HF_TOKEN_UPLOAD not set, skipping upload.")
-
-    return results
 
 
 if __name__ == "__main__":
