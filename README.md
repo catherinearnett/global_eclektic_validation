@@ -15,6 +15,7 @@ cd global_eclektic_validation
 export HF_TOKEN_READ
 export HF_TOKEN_WRITE
 export HF_TOKEN_UPLOAD
+export HF_TOKEN_MRL_READ
 ```
 
 ```
