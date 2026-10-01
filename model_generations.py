@@ -14,6 +14,7 @@ Requirements:
     pip install vllm pandas
 
 Usage:
+    export HF_TOKEN_READ=hf_...             # token with access to the gated models
     python3 model_generations.py            # run everything
     python3 model_generations.py --rerun    # ignore finished per-model results and regenerate
 """
@@ -26,6 +27,12 @@ import sys
 import time
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
+
+# Hugging Face libraries (vLLM, transformers) only read HF_TOKEN, so copy the
+# read token into it. Needed for gated models such as Llama.
+if os.environ.get("HF_TOKEN_READ"):
+    os.environ["HF_TOKEN"] = os.environ["HF_TOKEN_READ"]
+
 import pandas as pd
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -308,8 +315,15 @@ def run_all_models(df: pd.DataFrame, rerun: bool) -> list:
                 print(f"  [FAIL]  {safe_name(model_id)} exited with code {code} "
                       f"after {mins:.1f} min, see {log_path}")
                 with open(log_path, encoding="utf-8", errors="replace") as f:
-                    tail = f.read().splitlines()[-15:]
-                print("          " + "\n          ".join(tail))
+                    lines = f.read().splitlines()
+                # Show the actual error messages (root cause), not just the traceback tail
+                error_lines = []
+                for line in lines:
+                    text = re.sub(r"^\([^)]*\)\s*", "", line.strip())  # drop "(EngineCore pid=…)" prefix
+                    if re.match(r"^(\S+\.)?\w*(Error|Exception)\w*:", text) and text not in error_lines:
+                        error_lines.append(text)
+                shown = error_lines[-8:] if error_lines else lines[-15:]
+                print("          " + "\n          ".join(shown))
 
         time.sleep(5)
 
@@ -365,6 +379,9 @@ def main():
             f"[ERROR] vLLM is not installed for {sys.executable}\n"
             f"        Install it with:  {sys.executable} -m pip install -U vllm"
         )
+
+    if not os.environ.get("HF_TOKEN"):
+        print("[WARN] HF_TOKEN_READ is not set; gated models (e.g. Llama) will fail to download.\n")
 
     os.makedirs(WORK_DIR, exist_ok=True)
     df = filter_dataset(load_dataset(CSV_PATH))
