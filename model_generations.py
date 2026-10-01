@@ -2,6 +2,9 @@
 Generate answers from multiple models locally on GPU using vLLM,
 and evaluate using exact match scoring.
 
+Runs every language file in DATA_DIR (e.g. "Ukrainian - Questions.csv").
+Each model is loaded once and answers every language in one batched call.
+
 Each model is queried twice per row:
   - "orig": the original-language question  (Question -> Answer)
   - "en":   the English translation          (Question Corrected Translation -> Answer Corrected Translation)
@@ -10,13 +13,17 @@ Models run in parallel, each in its own process on its own set of GPUs
 (see GPUS_PER_MODEL). When a model finishes, its GPUs are freed and the next
 waiting model starts.
 
+Output: results/<language>.csv, one file per language (e.g. results/ukrainian.csv).
+Upload them with upload.py.
+
 Requirements:
     pip install vllm pandas
 
 Usage:
-    export HF_TOKEN_READ=hf_...             # token with access to the gated models
-    python3 model_generations.py            # run everything
-    python3 model_generations.py --rerun    # ignore finished per-model results and regenerate
+    export HF_TOKEN_READ=hf_...                       # token with access to the gated models
+    python3 model_generations.py                      # all languages
+    python3 model_generations.py --languages ukrainian,german
+    python3 model_generations.py --rerun              # regenerate results that already exist
 """
 
 import argparse
@@ -36,10 +43,11 @@ if os.environ.get("HF_TOKEN_READ"):
 import pandas as pd
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CSV_PATH = "global_eclektic_unfiltered/Ukrainian - Questions.csv"
-OUT_PATH = "model_generations_results.csv"
-WORK_DIR = "work"          # filtered dataset + per-model results
-LOG_DIR  = "logs"          # one log file per model
+DATA_DIR    = "global_eclektic_unfiltered"   # one CSV per language
+FILE_SUFFIX = " - Questions.csv"             # "Ukrainian - Questions.csv" -> language "ukrainian"
+RESULTS_DIR = "results"                      # final per-language results
+WORK_DIR    = "work"                         # filtered datasets + per-model results
+LOG_DIR     = "logs"                         # one log file per model
 
 # Model -> number of GPUs (tensor parallel size).
 # Must be a power of 2 that divides the model's attention heads (1, 2, 4, 8).
@@ -90,15 +98,44 @@ VARIANTS = {
     "en": ("Question Corrected Translation", "Answer Corrected Translation"),
 }
 
-FILTERED_PATH = os.path.join(WORK_DIR, "filtered_dataset.csv")
+
+# ── Languages and paths ───────────────────────────────────────────────────────
+def language_slug(name: str) -> str:
+    """'Ukrainian' -> 'ukrainian', 'Brazilian Portuguese' -> 'brazilian_portuguese'."""
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def discover_languages(data_dir: str = DATA_DIR) -> dict:
+    """Map language slug -> CSV path for every CSV in data_dir."""
+    languages = {}
+    for fname in sorted(os.listdir(data_dir)):
+        if not fname.lower().endswith(".csv"):
+            continue
+        name = fname[: -len(FILE_SUFFIX)] if fname.endswith(FILE_SUFFIX) else os.path.splitext(fname)[0]
+        slug = language_slug(name)
+        if not slug:
+            continue
+        if slug in languages:
+            raise SystemExit(f"[ERROR] Two files map to language '{slug}': "
+                             f"{languages[slug]} and {os.path.join(data_dir, fname)}")
+        languages[slug] = os.path.join(data_dir, fname)
+    return languages
 
 
 def safe_name(model_id: str) -> str:
     return model_id.split("/")[-1]
 
 
-def model_result_path(model_id: str) -> str:
-    return os.path.join(WORK_DIR, f"gen_{safe_name(model_id)}.csv")
+def filtered_path(lang: str) -> str:
+    return os.path.join(WORK_DIR, lang, "filtered_dataset.csv")
+
+
+def model_result_path(model_id: str, lang: str) -> str:
+    return os.path.join(WORK_DIR, lang, f"gen_{safe_name(model_id)}.csv")
+
+
+def results_path(lang: str) -> str:
+    return os.path.join(RESULTS_DIR, f"{lang}.csv")
 
 
 # ── Load dataset ──────────────────────────────────────────────────────────────
@@ -106,7 +143,7 @@ def load_dataset(csv_path: str) -> pd.DataFrame:
     print(f"Loading dataset from {csv_path} …")
     df = pd.read_csv(csv_path, encoding="utf-8", dtype=str)
     df.columns = df.columns.str.strip()
-    print(f"  Loaded {len(df)} raw rows.\n")
+    print(f"  Loaded {len(df)} raw rows.")
     return df
 
 
@@ -150,12 +187,12 @@ def filter_dataset(df: pd.DataFrame) -> pd.DataFrame:
     print(f"  Removed {no_original.sum()} rows with no original question/answer.")
 
     df = df.reset_index(drop=True)
-    print(f"  Kept {len(df)} of {n_start} rows.\n")
+    print(f"  Kept {len(df)} of {n_start} rows.")
     return df
 
 
-def read_filtered() -> pd.DataFrame:
-    return pd.read_csv(FILTERED_PATH, encoding="utf-8", dtype=str, keep_default_na=False)
+def read_filtered(lang: str) -> pd.DataFrame:
+    return pd.read_csv(filtered_path(lang), encoding="utf-8", dtype=str, keep_default_na=False)
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
@@ -169,7 +206,7 @@ def exact_match(prediction: str, gold: str) -> int:
     return int(normalize(prediction) == normalize(gold))
 
 
-# ── Worker: one model, run in its own process on its own GPUs ────────────────
+# ── Worker: one model, all its languages, in its own process on its own GPUs ─
 def build_prompt_ids(tokenizer, question: str, model_id: str) -> list:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -184,12 +221,14 @@ def build_prompt_ids(tokenizer, question: str, model_id: str) -> list:
     return tokenizer(text, add_special_tokens=False)["input_ids"]
 
 
-def run_worker(model_id: str, n_gpus: int, out_path: str) -> None:
+def run_worker(model_id: str, n_gpus: int, langs: list) -> None:
     from vllm import LLM, SamplingParams
 
-    df = read_filtered()
     name = safe_name(model_id)
-    print(f"[{name}] {len(df)} rows, tensor_parallel_size={n_gpus}", flush=True)
+    datasets = {lang: read_filtered(lang) for lang in langs}
+    n_rows = sum(len(df) for df in datasets.values())
+    print(f"[{name}] {len(langs)} languages, {n_rows} rows, "
+          f"tensor_parallel_size={n_gpus}", flush=True)
 
     llm = LLM(
         model=model_id,
@@ -201,34 +240,38 @@ def run_worker(model_id: str, n_gpus: int, out_path: str) -> None:
     tokenizer = llm.get_tokenizer()
     params = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS)
 
-    # Build every prompt for every variant and generate in a single batched call
+    # Every language x variant x question, generated in a single batched call
     prompts, keys = [], []
-    for variant, (question_col, _) in VARIANTS.items():
-        for q in df[question_col]:
-            prompts.append({"prompt_token_ids": build_prompt_ids(tokenizer, q, model_id)})
-            keys.append(variant)
+    for lang, df in datasets.items():
+        for variant, (question_col, _) in VARIANTS.items():
+            for q in df[question_col]:
+                prompts.append({"prompt_token_ids": build_prompt_ids(tokenizer, q, model_id)})
+                keys.append((lang, variant))
 
     start = time.time()
     outputs = llm.generate(prompts, params)
     print(f"[{name}] generated {len(outputs)} answers in {time.time() - start:.0f}s", flush=True)
 
-    gens = {variant: [] for variant in VARIANTS}
-    for variant, out in zip(keys, outputs):
-        gens[variant].append(out.outputs[0].text.strip())
+    gens = {(lang, variant): [] for lang in datasets for variant in VARIANTS}
+    for key, out in zip(keys, outputs):
+        gens[key].append(out.outputs[0].text.strip())
 
-    result = pd.DataFrame({"ID": df["ID"]})
-    for variant, (_, answer_col) in VARIANTS.items():
-        result[f"gen_{name}_{variant}"] = gens[variant]
-        result[f"em_{name}_{variant}"] = [
-            exact_match(g, gold) for g, gold in zip(gens[variant], df[answer_col])
-        ]
-        print(f"[{name}] Exact Match [{variant}]: "
-              f"{result[f'em_{name}_{variant}'].mean():.2%}", flush=True)
+    for lang, df in datasets.items():
+        result = pd.DataFrame({"ID": df["ID"]})
+        for variant, (_, answer_col) in VARIANTS.items():
+            g = gens[(lang, variant)]
+            result[f"gen_{name}_{variant}"] = g
+            result[f"em_{name}_{variant}"] = [
+                exact_match(p, gold) for p, gold in zip(g, df[answer_col])
+            ]
+            print(f"[{name}] {lang} Exact Match [{variant}]: "
+                  f"{result[f'em_{name}_{variant}'].mean():.2%}", flush=True)
 
-    tmp_path = out_path + ".tmp"
-    result.to_csv(tmp_path, index=False, encoding="utf-8-sig")
-    os.replace(tmp_path, out_path)   # only appears once complete
-    print(f"[{name}] saved {out_path}", flush=True)
+        out_path = model_result_path(model_id, lang)
+        tmp_path = out_path + ".tmp"
+        result.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        os.replace(tmp_path, out_path)   # only appears once complete
+        print(f"[{name}] saved {out_path}", flush=True)
 
 
 # ── Scheduler: run workers in parallel on separate GPUs ──────────────────────
@@ -245,30 +288,46 @@ def detect_gpus() -> int:
         raise SystemExit("[ERROR] Could not detect GPUs; set TOTAL_GPUS in the config.")
 
 
-def is_done(model_id: str, df: pd.DataFrame) -> bool:
-    """A model is done if its result file exists and matches the current dataset."""
-    path = model_result_path(model_id)
+def is_done(model_id: str, lang: str, df: pd.DataFrame) -> bool:
+    """Done if this model's result file for this language exists and matches the dataset."""
+    path = model_result_path(model_id, lang)
     if not os.path.exists(path):
         return False
     prev = pd.read_csv(path, encoding="utf-8-sig", dtype={"ID": str}, keep_default_na=False)
     return prev["ID"].tolist() == df["ID"].tolist()
 
 
-def run_all_models(df: pd.DataFrame, rerun: bool) -> list:
+def print_failure(log_path: str) -> None:
+    """Print the actual error lines (root cause) from a failed model's log."""
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    error_lines = []
+    for line in lines:
+        text = re.sub(r"^\([^)]*\)\s*", "", line.strip())  # drop "(EngineCore pid=…)" prefix
+        if re.search(r"\b\w*(Error|Exception)\w*: ", text) and text not in error_lines:
+            error_lines.append(text)
+    shown = error_lines[-12:] if error_lines else lines[-15:]
+    print("          " + "\n          ".join(shown))
+
+
+def run_all_models(datasets: dict, rerun: bool) -> list:
     os.makedirs(LOG_DIR, exist_ok=True)
     total = detect_gpus()
     print(f"Detected {total} GPUs.\n")
 
-    pending = []
+    # Which languages each model still needs
+    pending = {}
     for model_id in MODELS:
         if GPUS_PER_MODEL[model_id] > total:
             raise SystemExit(f"[ERROR] {model_id} needs {GPUS_PER_MODEL[model_id]} GPUs, "
                              f"only {total} available.")
-        if not rerun and is_done(model_id, df):
-            print(f"  [skip] {safe_name(model_id)} already has results "
-                  f"(use --rerun to regenerate)")
+        todo = [lang for lang, df in datasets.items()
+                if rerun or not is_done(model_id, lang, df)]
+        if todo:
+            pending[model_id] = todo
         else:
-            pending.append(model_id)
+            print(f"  [skip] {safe_name(model_id)} already has results for every language "
+                  f"(use --rerun to regenerate)")
 
     free_gpus = list(range(total))
     running = {}   # model_id -> (Popen, gpu list, log file, start time)
@@ -280,6 +339,7 @@ def run_all_models(df: pd.DataFrame, rerun: bool) -> list:
             n = GPUS_PER_MODEL[model_id]
             if n <= len(free_gpus):
                 gpus, free_gpus = free_gpus[:n], free_gpus[n:]
+                langs = pending.pop(model_id)
                 log_path = os.path.join(LOG_DIR, f"{safe_name(model_id)}.log")
                 log = open(log_path, "w", encoding="utf-8")
                 env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
@@ -287,12 +347,12 @@ def run_all_models(df: pd.DataFrame, rerun: bool) -> list:
                     [sys.executable, os.path.abspath(__file__),
                      "--worker", model_id,
                      "--gpus", str(n),
-                     "--out", model_result_path(model_id)],
+                     "--langs", ",".join(langs)],
                     env=env, stdout=log, stderr=subprocess.STDOUT,
                 )
                 running[model_id] = (proc, gpus, log, time.time())
-                pending.remove(model_id)
-                print(f"  [start] {safe_name(model_id)} on GPUs {gpus}  (log: {log_path})")
+                print(f"  [start] {safe_name(model_id)} on GPUs {gpus}, "
+                      f"{len(langs)} languages  (log: {log_path})")
 
         # Check for finished models and free their GPUs
         for model_id, (proc, gpus, log, started) in list(running.items()):
@@ -310,32 +370,23 @@ def run_all_models(df: pd.DataFrame, rerun: bool) -> list:
                 log_path = os.path.join(LOG_DIR, f"{safe_name(model_id)}.log")
                 print(f"  [FAIL]  {safe_name(model_id)} exited with code {code} "
                       f"after {mins:.1f} min, see {log_path}")
-                with open(log_path, encoding="utf-8", errors="replace") as f:
-                    lines = f.read().splitlines()
-                # Show the actual error messages (root cause), not just the traceback tail
-                error_lines = []
-                for line in lines:
-                    text = re.sub(r"^\([^)]*\)\s*", "", line.strip())  # drop "(EngineCore pid=…)" prefix
-                    if re.search(r"\b\w*(Error|Exception)\w*: ", text) and text not in error_lines:
-                        error_lines.append(text)
-                shown = error_lines[-12:] if error_lines else lines[-15:]
-                print("          " + "\n          ".join(shown))
+                print_failure(log_path)
 
         time.sleep(5)
 
     return failed
 
 
-# ── Merge per-model results into the final file ───────────────────────────────
-def merge_results(df: pd.DataFrame) -> pd.DataFrame:
+# ── Merge per-model results into one file per language ────────────────────────
+def merge_results(lang: str, df: pd.DataFrame) -> pd.DataFrame:
     # Keep every dataset column except Exclude (already applied in filter_dataset)
     results = df.drop(columns="Exclude", errors="ignore").copy()
 
     for model_id in MODELS:
-        if not is_done(model_id, df):
-            print(f"  [WARN] No results for {safe_name(model_id)}, left out of the final file.")
+        if not is_done(model_id, lang, df):
+            print(f"  [WARN] {lang}: no results for {safe_name(model_id)}, left out.")
             continue
-        model_df = pd.read_csv(model_result_path(model_id), encoding="utf-8-sig",
+        model_df = pd.read_csv(model_result_path(model_id, lang), encoding="utf-8-sig",
                                dtype={"ID": str}, keep_default_na=False)
         results = pd.concat([results, model_df.drop(columns="ID")], axis=1)
 
@@ -343,7 +394,7 @@ def merge_results(df: pd.DataFrame) -> pd.DataFrame:
     for col in em_cols:
         results[col] = results[col].astype(int)
 
-    print("\nExact Match per model:")
+    print(f"\n{lang}: Exact Match per model")
     for col in em_cols:
         print(f"  {col.replace('em_', '')}: {results[col].mean():.2%}")
 
@@ -355,17 +406,38 @@ def merge_results(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+def prepare_datasets(languages: dict) -> dict:
+    """Filter every language file and save it for the workers. Returns slug -> DataFrame."""
+    datasets = {}
+    for lang, path in languages.items():
+        print(f"\n── {lang} " + "─" * max(0, 60 - len(lang)))
+        try:
+            df = filter_dataset(load_dataset(path))
+        except (KeyError, pd.errors.ParserError, UnicodeDecodeError) as e:
+            print(f"  [SKIP] {lang}: {e}")
+            continue
+        if df.empty:
+            print(f"  [SKIP] {lang}: no rows left after filtering.")
+            continue
+        os.makedirs(os.path.dirname(filtered_path(lang)), exist_ok=True)
+        df.to_csv(filtered_path(lang), index=False, encoding="utf-8")
+        datasets[lang] = read_filtered(lang)   # read back so workers and merge see identical data
+    return datasets
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rerun", action="store_true",
-                        help="regenerate models that already have results")
+                        help="regenerate results that already exist")
+    parser.add_argument("--languages",
+                        help="comma-separated languages to run, e.g. ukrainian,german (default: all)")
     parser.add_argument("--worker", help=argparse.SUPPRESS)
     parser.add_argument("--gpus", type=int, help=argparse.SUPPRESS)
-    parser.add_argument("--out", help=argparse.SUPPRESS)
+    parser.add_argument("--langs", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.worker:
-        run_worker(args.worker, args.gpus, args.out)
+        run_worker(args.worker, args.gpus, args.langs.split(","))
         return
 
     # Fail fast if vLLM isn't installed in this Python (workers use the same one)
@@ -379,33 +451,30 @@ def main():
     if not os.environ.get("HF_TOKEN"):
         print("[WARN] HF_TOKEN_READ is not set; gated models (e.g. Llama) will fail to download.\n")
 
-    os.makedirs(WORK_DIR, exist_ok=True)
-    df = filter_dataset(load_dataset(CSV_PATH))
-    df.to_csv(FILTERED_PATH, index=False, encoding="utf-8")
-    df = read_filtered()   # read back so workers and merge see identical data
+    languages = discover_languages()
+    if args.languages:
+        wanted = [language_slug(x) for x in args.languages.split(",") if x.strip()]
+        unknown = [w for w in wanted if w not in languages]
+        if unknown:
+            raise SystemExit(f"[ERROR] Unknown languages {unknown}. Available: {list(languages)}")
+        languages = {w: languages[w] for w in wanted}
+    print(f"Found {len(languages)} languages in {DATA_DIR}: {', '.join(languages)}")
 
-    failed = run_all_models(df, args.rerun)
+    datasets = prepare_datasets(languages)
+    if not datasets:
+        raise SystemExit("[ERROR] No usable language files.")
+    print(f"\nRunning {len(MODELS)} models on {len(datasets)} languages.")
+
+    failed = run_all_models(datasets, args.rerun)
     if failed:
         print(f"\n[WARN] Failed models: {[safe_name(m) for m in failed]}")
 
-    results = merge_results(df)
-    results.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
-    print(f"\nResults saved to {OUT_PATH}")
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    for lang, df in datasets.items():
+        merge_results(lang, df).to_csv(results_path(lang), index=False, encoding="utf-8-sig")
+        print(f"  saved {results_path(lang)}")
 
-    # ── Upload to HuggingFace dataset repo ───────────────────────────────────
-    hf_upload_token = os.environ.get("HF_TOKEN_UPLOAD")
-    if hf_upload_token:
-        from huggingface_hub import HfApi
-        api = HfApi(token=hf_upload_token)
-        api.upload_file(
-            path_or_fileobj=OUT_PATH,
-            path_in_repo="model_generations_results.csv",
-            repo_id="mrlbenchmarks/validation",
-            repo_type="dataset",
-        )
-        print("Uploaded to hf.co/datasets/mrlbenchmarks/validation")
-    else:
-        print("[SKIP] HF_TOKEN_UPLOAD not set, skipping upload.")
+    print("\nDone. Upload with:  python3 upload.py")
 
 
 if __name__ == "__main__":
