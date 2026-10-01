@@ -18,7 +18,5 @@ export HF_TOKEN_UPLOAD
 ```
 
 ```
-python3 model_generations.py
-python3 sample_dataset.py
-python3 upload.py
+sample_and_filter.py
 ```
