@@ -36,8 +36,6 @@ MAX_NEW_TOKENS = 100
 # Columns to keep, in this order
 KEEP_COLUMNS = [
     "ID",
-    "Author",
-    "Checked By",
     "Language",
     "Country/Region",
     "Question",
@@ -47,8 +45,6 @@ KEEP_COLUMNS = [
     "Question Corrected Translation",
     "Answer Automatic Translation",
     "Answer Corrected Translation",
-    "Translation Corrected By",
-    "Notes",
     "URL language (if different from target language)",
     "Exclude",
 ]
