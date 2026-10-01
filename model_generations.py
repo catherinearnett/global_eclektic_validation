@@ -65,8 +65,6 @@ SYSTEM_PROMPT = (
 # Columns to keep, in this order
 KEEP_COLUMNS = [
     "ID",
-    "Author",
-    "Checked By",
     "Language",
     "Country/Region",
     "Question",
@@ -76,8 +74,6 @@ KEEP_COLUMNS = [
     "Question Corrected Translation",
     "Answer Automatic Translation",
     "Answer Corrected Translation",
-    "Translation Corrected By",
-    "Notes",
     "URL language (if different from target language)",
     "Exclude",
 ]
@@ -320,9 +316,9 @@ def run_all_models(df: pd.DataFrame, rerun: bool) -> list:
                 error_lines = []
                 for line in lines:
                     text = re.sub(r"^\([^)]*\)\s*", "", line.strip())  # drop "(EngineCore pid=…)" prefix
-                    if re.match(r"^(\S+\.)?\w*(Error|Exception)\w*:", text) and text not in error_lines:
+                    if re.search(r"\b\w*(Error|Exception)\w*: ", text) and text not in error_lines:
                         error_lines.append(text)
-                shown = error_lines[-8:] if error_lines else lines[-15:]
+                shown = error_lines[-12:] if error_lines else lines[-15:]
                 print("          " + "\n          ".join(shown))
 
         time.sleep(5)
