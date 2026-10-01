@@ -304,8 +304,12 @@ def run_all_models(df: pd.DataFrame, rerun: bool) -> list:
                 print(f"  [done]  {safe_name(model_id)} in {mins:.1f} min, freed GPUs {gpus}")
             else:
                 failed.append(model_id)
+                log_path = os.path.join(LOG_DIR, f"{safe_name(model_id)}.log")
                 print(f"  [FAIL]  {safe_name(model_id)} exited with code {code} "
-                      f"after {mins:.1f} min, see {LOG_DIR}/{safe_name(model_id)}.log")
+                      f"after {mins:.1f} min, see {log_path}")
+                with open(log_path, encoding="utf-8", errors="replace") as f:
+                    tail = f.read().splitlines()[-15:]
+                print("          " + "\n          ".join(tail))
 
         time.sleep(5)
 
@@ -353,6 +357,14 @@ def main():
     if args.worker:
         run_worker(args.worker, args.gpus, args.out)
         return
+
+    # Fail fast if vLLM isn't installed in this Python (workers use the same one)
+    import importlib.util
+    if importlib.util.find_spec("vllm") is None:
+        raise SystemExit(
+            f"[ERROR] vLLM is not installed for {sys.executable}\n"
+            f"        Install it with:  {sys.executable} -m pip install -U vllm"
+        )
 
     os.makedirs(WORK_DIR, exist_ok=True)
     df = filter_dataset(load_dataset(CSV_PATH))
