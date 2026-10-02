@@ -96,7 +96,7 @@ MODELS = list(GPUS_PER_MODEL)
 TOTAL_GPUS = None          # None = use every GPU that is currently free
 
 # ── GPU safety ────────────────────────────────────────────────────────────────
-MAX_PARALLEL_MODELS = 1    # models running at the same time (1 = one after another)
+MAX_PARALLEL_MODELS = 3    # models running at the same time (1 = one after another)
 STAGGER_SECONDS     = 180  # min. wait between starting two models, so their loading
                            # (CPU RAM + GPU memory spikes) doesn't overlap
 GPU_FREE_MIB        = 2000 # a GPU counts as free if it has less than this much memory in use
