@@ -7,7 +7,9 @@ Steps:
             original question and its English translation. Scoring: both answers are
             lowercased with punctuation and extra spaces removed, and a generation is
             correct (em_* = 1) if it contains the expected answer as whole words.
-            Uses vLLM; models run in parallel on separate GPUs.
+            Uses vLLM. By default models run one after another (MAX_PARALLEL_MODELS),
+            prompts are sent in small batches, and each language is saved as soon as
+            it's done, so a crash only loses the language in progress.
             -> results/<language>.csv
   select    Per language, keep the top 100 questions by spread in the original-language
             scores across models. The translation pairs become "Question Translation" and
@@ -20,6 +22,13 @@ A language that is already uploaded is never generated, selected or uploaded aga
 To redo one, delete its file from the repo first. If the repo can't be checked
 (no token, no access, not created yet), the script stops rather than risk re-running.
 A language whose results are missing any model is not selected or uploaded.
+
+GPU safety (see "GPU safety" in the config):
+  - Only GPUs with almost no memory in use are used; busy GPUs are left alone.
+  - MAX_PARALLEL_MODELS models at a time (default 1), started STAGGER_SECONDS apart.
+  - Prompts go to vLLM BATCH_SIZE at a time, with at most MAX_NUM_SEQS on the GPU at once.
+  - Ctrl+C or an error stops every worker and its vLLM child processes, so no
+    orphaned process keeps holding GPU memory.
 
 Setup (needs an NVIDIA driver supporting CUDA 12.x):
     uv venv eclektic --python 3.11 && source eclektic/bin/activate
@@ -42,6 +51,7 @@ import argparse
 import importlib.util
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -83,11 +93,20 @@ GPUS_PER_MODEL = {
 }
 MODELS = list(GPUS_PER_MODEL)
 
-TOTAL_GPUS = None          # None = detect automatically
+TOTAL_GPUS = None          # None = use every GPU that is currently free
+
+# ── GPU safety ────────────────────────────────────────────────────────────────
+MAX_PARALLEL_MODELS = 1    # models running at the same time (1 = one after another)
+STAGGER_SECONDS     = 180  # min. wait between starting two models, so their loading
+                           # (CPU RAM + GPU memory spikes) doesn't overlap
+GPU_FREE_MIB        = 2000 # a GPU counts as free if it has less than this much memory in use
+BATCH_SIZE          = 256  # prompts per llm.generate() call
+MAX_NUM_SEQS        = 64   # max sequences vLLM runs on the GPU at once
+GPU_MEM_UTIL        = 0.85 # share of each GPU's memory vLLM may take (leave some headroom)
+ENFORCE_EAGER       = False  # True skips CUDA graphs: less memory, somewhat slower
 
 MAX_NEW_TOKENS = 50
 MAX_MODEL_LEN  = 4096      # prompts are short; a small context leaves more memory for batching
-GPU_MEM_UTIL   = 0.90
 
 SYSTEM_PROMPT = (
     "Answer the following question as briefly as possible. "
@@ -361,14 +380,23 @@ def build_prompt_ids(tokenizer, question: str, model_id: str) -> list:
     return tokenizer(text, add_special_tokens=False)["input_ids"]
 
 
+def generate_in_batches(llm, params, prompts: list, label: str) -> list:
+    """Run prompts through vLLM BATCH_SIZE at a time; returns the answer texts in order."""
+    texts = []
+    for i in range(0, len(prompts), BATCH_SIZE):
+        outputs = llm.generate(prompts[i:i + BATCH_SIZE], params, use_tqdm=False)
+        texts.extend(out.outputs[0].text.strip() for out in outputs)
+        print(f"{label} {len(texts)}/{len(prompts)}", flush=True)
+    return texts
+
+
 def run_worker(model_id: str, n_gpus: int, langs: list) -> None:
     from vllm import LLM, SamplingParams
 
     name = safe_name(model_id)
-    datasets = {lang: read_filtered(lang) for lang in langs}
-    n_rows = sum(len(df) for df in datasets.values())
-    print(f"[{name}] {len(langs)} languages, {n_rows} rows, "
-          f"tensor_parallel_size={n_gpus}", flush=True)
+    print(f"[{name}] {len(langs)} languages, tensor_parallel_size={n_gpus}, "
+          f"batch_size={BATCH_SIZE}, max_num_seqs={MAX_NUM_SEQS}, "
+          f"gpu_memory_utilization={GPU_MEM_UTIL}", flush=True)
 
     llm = LLM(
         model=model_id,
@@ -376,30 +404,22 @@ def run_worker(model_id: str, n_gpus: int, langs: list) -> None:
         dtype="bfloat16",
         max_model_len=MAX_MODEL_LEN,
         gpu_memory_utilization=GPU_MEM_UTIL,
+        max_num_seqs=MAX_NUM_SEQS,
+        enforce_eager=ENFORCE_EAGER,
     )
     tokenizer = llm.get_tokenizer()
     params = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS)
 
-    # Every language x variant x question, generated in a single batched call
-    prompts, keys = [], []
-    for lang, df in datasets.items():
-        for variant, (question_col, _) in VARIANTS.items():
-            for q in df[question_col]:
-                prompts.append({"prompt_token_ids": build_prompt_ids(tokenizer, q, model_id)})
-                keys.append((lang, variant))
-
-    start = time.time()
-    outputs = llm.generate(prompts, params)
-    print(f"[{name}] generated {len(outputs)} answers in {time.time() - start:.0f}s", flush=True)
-
-    gens = {(lang, variant): [] for lang in datasets for variant in VARIANTS}
-    for key, out in zip(keys, outputs):
-        gens[key].append(out.outputs[0].text.strip())
-
-    for lang, df in datasets.items():
+    # One language at a time, saved as soon as it's done: a crash only loses
+    # the language in progress, and a re-run picks up where it stopped
+    for lang in langs:
+        df = read_filtered(lang)
+        start = time.time()
         result = pd.DataFrame({"ID": df["ID"]})
-        for variant, (_, answer_col) in VARIANTS.items():
-            g = gens[(lang, variant)]
+        for variant, (question_col, answer_col) in VARIANTS.items():
+            prompts = [{"prompt_token_ids": build_prompt_ids(tokenizer, q, model_id)}
+                       for q in df[question_col]]
+            g = generate_in_batches(llm, params, prompts, f"[{name}] {lang} [{variant}]")
             result[f"gen_{name}_{variant}"] = g
             result[f"em_{name}_{variant}"] = [
                 flexible_match(p, gold) for p, gold in zip(g, df[answer_col])
@@ -411,21 +431,40 @@ def run_worker(model_id: str, n_gpus: int, langs: list) -> None:
         tmp_path = out_path + ".tmp"
         result.to_csv(tmp_path, index=False, encoding="utf-8-sig")
         os.replace(tmp_path, out_path)   # only appears once complete
-        print(f"[{name}] saved {out_path}", flush=True)
+        print(f"[{name}] saved {out_path} ({time.time() - start:.0f}s)", flush=True)
 
 
-# ── Scheduler: run workers in parallel on separate GPUs ──────────────────────
-def detect_gpus() -> int:
+# ── Scheduler: run workers on separate GPUs, a limited number at a time ──────
+def detect_free_gpus() -> list:
+    """Indices of GPUs that are free to use. GPUs with more than GPU_FREE_MIB in use
+    (someone else's job, a leftover process) are skipped."""
     if TOTAL_GPUS:
-        return TOTAL_GPUS
+        return list(range(TOTAL_GPUS))
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=index,memory.used",
+             "--format=csv,noheader,nounits"],
             capture_output=True, text=True, check=True,
         ).stdout
-        return len([line for line in out.splitlines() if line.strip()])
     except (OSError, subprocess.CalledProcessError):
         raise SystemExit("[ERROR] Could not detect GPUs; set TOTAL_GPUS in the config.")
+
+    free, busy = [], []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        idx, used = [x.strip() for x in line.split(",")[:2]]
+        try:
+            in_use = int(float(used))
+        except ValueError:
+            in_use = None           # "[N/A]": can't tell, so don't risk it
+        if in_use is not None and in_use < GPU_FREE_MIB:
+            free.append(int(idx))
+        else:
+            busy.append(f"{idx} ({used} MiB)")
+    if busy:
+        print(f"  [WARN] Skipping GPUs already in use: {', '.join(busy)}")
+    return free
 
 
 def is_done(model_id: str, lang: str, df: pd.DataFrame) -> bool:
@@ -450,17 +489,33 @@ def print_failure(log_path: str) -> None:
     print("          " + "\n          ".join(shown))
 
 
+def stop_worker(proc: subprocess.Popen) -> None:
+    """Stop a worker and every process it started (vLLM engine, tensor-parallel workers),
+    so nothing is left holding GPU memory."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    except ProcessLookupError:
+        pass
+
+
 def run_all_models(datasets: dict, rerun: bool) -> list:
     os.makedirs(LOG_DIR, exist_ok=True)
-    total = detect_gpus()
-    print(f"\nDetected {total} GPUs.")
+    gpus_available = detect_free_gpus()
+    print(f"\nUsing {len(gpus_available)} free GPUs: {gpus_available}. "
+          f"Up to {MAX_PARALLEL_MODELS} model(s) at a time.")
 
     # Which languages each model still needs
     pending = {}
     for model_id in MODELS:
-        if GPUS_PER_MODEL[model_id] > total:
+        if GPUS_PER_MODEL[model_id] > len(gpus_available):
             raise SystemExit(f"[ERROR] {model_id} needs {GPUS_PER_MODEL[model_id]} GPUs, "
-                             f"only {total} available.")
+                             f"only {len(gpus_available)} free.")
         todo = [lang for lang, df in datasets.items()
                 if rerun or not is_done(model_id, lang, df)]
         if todo:
@@ -469,50 +524,71 @@ def run_all_models(datasets: dict, rerun: bool) -> list:
             print(f"  [skip] {safe_name(model_id)} already has local results for every language "
                   f"(use --rerun to regenerate)")
 
-    free_gpus = list(range(total))
+    free_gpus = list(gpus_available)
     running = {}   # model_id -> (Popen, gpu list, log file, start time)
     failed = []
+    last_start = 0.0
 
-    while pending or running:
-        # Start every pending model that fits on the free GPUs, in MODELS order
-        for model_id in list(pending):
-            n = GPUS_PER_MODEL[model_id]
-            if n <= len(free_gpus):
+    try:
+        while pending or running:
+            # Start pending models (in MODELS order) while under the limits
+            for model_id in list(pending):
+                if len(running) >= MAX_PARALLEL_MODELS:
+                    break
+                if running and time.time() - last_start < STAGGER_SECONDS:
+                    break   # let the previous model finish loading first
+                n = GPUS_PER_MODEL[model_id]
+                if n > len(free_gpus):
+                    continue
                 gpus, free_gpus = free_gpus[:n], free_gpus[n:]
                 langs = pending.pop(model_id)
                 log_path = os.path.join(LOG_DIR, f"{safe_name(model_id)}.log")
                 log = open(log_path, "w", encoding="utf-8")
-                env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus))}
+                env = {
+                    **os.environ,
+                    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",   # same numbering as nvidia-smi
+                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpus)),
+                }
                 proc = subprocess.Popen(
                     [sys.executable, os.path.abspath(__file__),
                      "--worker", model_id,
                      "--gpus", str(n),
                      "--langs", ",".join(langs)],
                     env=env, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True,   # own process group, so it can be stopped as a whole
                 )
                 running[model_id] = (proc, gpus, log, time.time())
+                last_start = time.time()
                 print(f"  [start] {safe_name(model_id)} on GPUs {gpus}, "
                       f"{len(langs)} languages  (log: {log_path})")
 
-        # Check for finished models and free their GPUs
-        for model_id, (proc, gpus, log, started) in list(running.items()):
-            code = proc.poll()
-            if code is None:
-                continue
-            log.close()
-            free_gpus = sorted(free_gpus + gpus)
-            del running[model_id]
-            mins = (time.time() - started) / 60
-            if code == 0:
-                print(f"  [done]  {safe_name(model_id)} in {mins:.1f} min, freed GPUs {gpus}")
-            else:
-                failed.append(model_id)
-                log_path = os.path.join(LOG_DIR, f"{safe_name(model_id)}.log")
-                print(f"  [FAIL]  {safe_name(model_id)} exited with code {code} "
-                      f"after {mins:.1f} min, see {log_path}")
-                print_failure(log_path)
+            # Check for finished models and free their GPUs
+            for model_id, (proc, gpus, log, started) in list(running.items()):
+                code = proc.poll()
+                if code is None:
+                    continue
+                stop_worker(proc)   # no-op normally; cleans up if children outlived it
+                log.close()
+                free_gpus = sorted(free_gpus + gpus)
+                del running[model_id]
+                mins = (time.time() - started) / 60
+                if code == 0:
+                    print(f"  [done]  {safe_name(model_id)} in {mins:.1f} min, freed GPUs {gpus}")
+                else:
+                    failed.append(model_id)
+                    log_path = os.path.join(LOG_DIR, f"{safe_name(model_id)}.log")
+                    print(f"  [FAIL]  {safe_name(model_id)} exited with code {code} "
+                          f"after {mins:.1f} min, see {log_path}")
+                    print_failure(log_path)
 
-        time.sleep(5)
+            time.sleep(5)
+    finally:
+        # On Ctrl+C or any error, don't leave workers running on the GPUs
+        if running:
+            print(f"\n  Stopping {len(running)} running model(s) …")
+        for proc, _, log, _ in running.values():
+            stop_worker(proc)
+            log.close()
 
     return failed
 
