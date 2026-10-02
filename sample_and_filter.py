@@ -4,7 +4,9 @@ language, and upload to mrlbenchmarks/global_eclektic with one split per languag
 
 Steps:
   generate  For every language CSV in global_eclektic_unfiltered/, run each model on the
-            original question and its English translation, scored by exact match.
+            original question and its English translation. Scoring: both answers are
+            lowercased with punctuation and extra spaces removed, and a generation is
+            correct (em_* = 1) if it contains the expected answer as whole words.
             Uses vLLM; models run in parallel on separate GPUs.
             -> results/<language>.csv
   select    Per language, keep the top 100 questions by spread in the original-language
@@ -43,6 +45,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
@@ -323,14 +326,24 @@ def prepare_datasets(languages: dict) -> dict:
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
-def normalize(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
+def normalize(text) -> str:
+    """Lowercase, turn punctuation into spaces, and collapse whitespace.
+    'Jean-Paul Sartre.' -> 'jean paul sartre'"""
+    if not isinstance(text, str):
+        return ""
+    text = unicodedata.normalize("NFKC", text).lower()
+    text = text.replace("ʼ", " ")          # Ukrainian apostrophe ʼ counts as a letter otherwise
+    text = re.sub(r"[^\w\s]|_", " ", text)      # punctuation -> space
     return " ".join(text.split())
 
 
-def exact_match(prediction: str, gold: str) -> int:
-    return int(normalize(prediction) == normalize(gold))
+def flexible_match(prediction, gold) -> int:
+    """1 if the normalised gold answer appears in the normalised generation as whole
+    words ('kyiv' matches 'the capital is kyiv', not 'kyivska'), else 0."""
+    gold_norm = normalize(gold)
+    if not gold_norm:
+        return 0
+    return int(f" {gold_norm} " in f" {normalize(prediction)} ")
 
 
 # ── Worker: one model, all its languages, in its own process on its own GPUs ─
@@ -389,9 +402,9 @@ def run_worker(model_id: str, n_gpus: int, langs: list) -> None:
             g = gens[(lang, variant)]
             result[f"gen_{name}_{variant}"] = g
             result[f"em_{name}_{variant}"] = [
-                exact_match(p, gold) for p, gold in zip(g, df[answer_col])
+                flexible_match(p, gold) for p, gold in zip(g, df[answer_col])
             ]
-            print(f"[{name}] {lang} Exact Match [{variant}]: "
+            print(f"[{name}] {lang} accuracy [{variant}]: "
                   f"{result[f'em_{name}_{variant}'].mean():.2%}", flush=True)
 
         out_path = model_result_path(model_id, lang)
@@ -514,13 +527,21 @@ def merge_results(lang: str, df: pd.DataFrame) -> pd.DataFrame:
             continue
         model_df = pd.read_csv(model_result_path(model_id, lang), encoding="utf-8-sig",
                                dtype={"ID": str}, keep_default_na=False)
+        # Re-score from the saved generations, so a scoring change applies
+        # to existing local results without regenerating
+        name = safe_name(model_id)
+        for variant, (_, answer_col) in VARIANTS.items():
+            model_df[f"em_{name}_{variant}"] = [
+                flexible_match(p, gold)
+                for p, gold in zip(model_df[f"gen_{name}_{variant}"], df[answer_col])
+            ]
         results = pd.concat([results, model_df.drop(columns="ID")], axis=1)
 
     em_cols = [c for c in results.columns if c.startswith("em_")]
     for col in em_cols:
         results[col] = results[col].astype(int)
 
-    print(f"\n{lang}: Exact Match per model")
+    print(f"\n{lang}: accuracy per model")
     for col in em_cols:
         print(f"  {col.replace('em_', '')}: {results[col].mean():.2%}")
 
@@ -630,7 +651,7 @@ def select_top(df: pd.DataFrame, lang: str) -> pd.DataFrame:
     if len(top):
         print(f"  Spread: max {top['spread'].max():.4f}, min {top['spread'].min():.4f}, "
               f"mean {top['spread'].mean():.4f}; ≥1 correct: {top['any_correct'].sum()}")
-        print(f"  Per-model exact match on top {len(top)}:")
+        print(f"  Per-model accuracy on top {len(top)}:")
         for col in em_cols_all:
             tag = " (used for selection)" if col in em_cols else ""
             print(f"    {col.replace('em_', '')}: {top[col].mean():.2%}{tag}")
