@@ -19,5 +19,5 @@ export HF_TOKEN_MRL_READ
 ```
 
 ```
-sample_and_filter.py
+python3 sample_and_filter.py
 ```
