@@ -1,6 +1,7 @@
 """
 Global ECLeKTic pipeline: generate model answers, select the top 100 questions per
-language, and upload to mrlbenchmarks/global_eclektic with one split per language.
+language, and upload the top 100 to mrlbenchmarks/global_eclektic with one split
+per language.
 
 Steps:
   generate  For every language CSV in global_eclektic_unfiltered/, run each model on the
@@ -10,16 +11,16 @@ Steps:
             Uses vLLM. By default models run one after another (MAX_PARALLEL_MODELS),
             prompts are sent in small batches, and each language is saved as soon as
             it's done, so a crash only loses the language in progress.
-            -> results/<language>.csv
+            -> results/<language>.csv   (kept locally, not uploaded)
   select    Per language, keep the top 100 questions by spread in the original-language
             scores across models. The translation pairs become "Question Translation" and
             "Answer Translation" (corrected if available, otherwise automatic).
             -> top100/<language>.csv
-  upload    Push results/ and top100/ to mrlbenchmarks/global_eclektic as two subsets
-            ("generations", the default, and "top100"), one split per language.
+  upload    Push top100/ to mrlbenchmarks/global_eclektic, one split per language.
+            The generations in results/ are not uploaded.
 
-A language that is already uploaded is never generated, selected or uploaded again.
-To redo one, delete its file from the repo first. If the repo can't be checked
+A language whose top 100 is already uploaded is never generated, selected or uploaded
+again. To redo one, delete its file from the repo first. If the repo can't be checked
 (no token, no access, not created yet), the script stops rather than risk re-running.
 A language whose results are missing any model is not selected or uploaded.
 
@@ -44,7 +45,6 @@ Usage:
     python3 global_eclektic.py generate                 # one step: generate | select | upload
     python3 global_eclektic.py --languages ukrainian,german
     python3 global_eclektic.py generate --rerun         # regenerate local results not yet uploaded
-    python3 global_eclektic.py select --source hf       # select from generations already on HF
 """
 
 import argparse
@@ -79,7 +79,11 @@ SUBSETS = {
     "generations": ("results", "data/generations"),
     "top100":      ("top100",  "data/top100"),
 }
-DEFAULT_SUBSET = "generations"
+# Only these subsets are uploaded; the others stay local
+UPLOAD_SUBSETS = ["top100"]
+DEFAULT_SUBSET = "top100"
+# Subset whose presence in the repo marks a language as done
+DONE_SUBSET = "top100"
 # Tokens tried in this order to read the repo (it may be private)
 READ_TOKEN_VARS = ("HF_TOKEN_UPLOAD", "HF_TOKEN_READ", "HF_TOKEN_MRL_READ")
 
@@ -154,13 +158,12 @@ TOP100_TRANSLATION_COLUMNS = ["Question Translation", "Answer Translation"]
 
 README_BODY = """# Global ECLeKTic
 
-Each language is its own split. Subsets:
+Each language is its own split. Subset:
 
-- `generations`: every filtered question with each model's answers (`gen_*`) and
-  exact-match scores (`em_*`), for the original question (`_orig`) and its English
-  translation (`_en`).
 - `top100`: per language, the 100 questions with the largest spread in
-  original-language scores across models.
+  original-language exact-match scores across models, with each model's answers
+  (`gen_*`) and exact-match scores (`em_*`) for the original question (`_orig`)
+  and its English translation (`_en`).
 """
 
 
@@ -648,8 +651,8 @@ def step_generate(args, files: set) -> None:
         languages = {w: languages[w] for w in wanted}
     print(f"Found {len(languages)} languages in {DATA_DIR}: {', '.join(languages)}")
 
-    # Never re-run a language whose generations are already uploaded
-    uploaded = uploaded_languages("generations", files)
+    # Never re-run a language whose top 100 is already uploaded
+    uploaded = uploaded_languages(DONE_SUBSET, files)
     done = [lang for lang in languages if lang in uploaded]
     if done:
         print(f"  [skip] Already uploaded to {REPO_ID}, not re-run: {', '.join(done)}")
@@ -675,13 +678,8 @@ def step_generate(args, files: set) -> None:
 
 
 # ══ Step 2: select ════════════════════════════════════════════════════════════
-def load_results(lang: str, source: str) -> pd.DataFrame:
-    path = results_path(lang)
-    if source == "hf":
-        from huggingface_hub import hf_hub_download
-        path = hf_hub_download(REPO_ID, f"{SUBSETS['generations'][1]}/{lang}.csv",
-                               repo_type="dataset", token=read_token())
-    df = pd.read_csv(path, encoding="utf-8-sig", dtype={"ID": str})
+def load_results(lang: str) -> pd.DataFrame:
+    df = pd.read_csv(results_path(lang), encoding="utf-8-sig", dtype={"ID": str})
     return df[df["Question"] != SUMMARY_LABEL].reset_index(drop=True)
 
 
@@ -756,19 +754,16 @@ def merge_translations(df: pd.DataFrame) -> pd.DataFrame:
 def step_select(args, files: set) -> None:
     section("select")
 
-    if args.source == "local":
-        local_dir = SUBSETS["generations"][0]
-        langs = sorted(os.path.splitext(f)[0] for f in os.listdir(local_dir)
-                       if f.endswith(".csv")) if os.path.isdir(local_dir) else []
-    else:
-        langs = sorted(uploaded_languages("generations", files))
+    local_dir = SUBSETS["generations"][0]
+    langs = sorted(os.path.splitext(f)[0] for f in os.listdir(local_dir)
+                   if f.endswith(".csv")) if os.path.isdir(local_dir) else []
     wanted = wanted_languages(args)
     if wanted:
         langs = [lang for lang in langs if lang in wanted]
     if not langs:
-        print(f"Nothing to select: no results found ({args.source}).")
+        print(f"Nothing to select: no results found in {local_dir}/.")
         return
-    print(f"Found results for {len(langs)} languages ({args.source}): {', '.join(langs)}")
+    print(f"Found results for {len(langs)} languages: {', '.join(langs)}")
 
     # Never redo a language whose top 100 is already uploaded
     uploaded = uploaded_languages("top100", files)
@@ -779,7 +774,7 @@ def step_select(args, files: set) -> None:
 
     os.makedirs(SUBSETS["top100"][0], exist_ok=True)
     for lang in langs:
-        top = select_top(load_results(lang, args.source), lang)
+        top = select_top(load_results(lang), lang)
         if top is not None:
             top.to_csv(top_path(lang), index=False, encoding="utf-8-sig")
             print(f"  Saved to {top_path(lang)}")
@@ -787,9 +782,10 @@ def step_select(args, files: set) -> None:
 
 # ══ Step 3: upload ════════════════════════════════════════════════════════════
 def build_configs(files: set) -> list:
-    """One config per subset, one split per language file found in the repo."""
+    """One config per uploaded subset, one split per language file found in the repo."""
     configs = []
-    for subset, (_, repo_dir) in SUBSETS.items():
+    for subset in UPLOAD_SUBSETS:
+        repo_dir = SUBSETS[subset][1]
         paths = sorted(f for f in files if f.startswith(repo_dir + "/") and f.endswith(".csv"))
         if not paths:
             continue
@@ -831,7 +827,8 @@ def step_upload(args, files: set) -> None:
 
     # Collect local files that aren't in the repo yet; never overwrite an uploaded language
     operations = []
-    for subset, (local_dir, repo_dir) in SUBSETS.items():
+    for subset in UPLOAD_SUBSETS:
+        local_dir, repo_dir = SUBSETS[subset]
         if not os.path.isdir(local_dir):
             print(f"  [skip] {subset}: no {local_dir}/ folder")
             continue
@@ -876,7 +873,7 @@ def step_upload(args, files: set) -> None:
         repo_id=REPO_ID,
         repo_type="dataset",
         operations=operations,
-        commit_message="Upload per-language results",
+        commit_message="Upload per-language top 100",
     )
     print(f"Uploaded {len(operations) - 1} files to hf.co/datasets/{REPO_ID}")
 
@@ -894,8 +891,6 @@ def main():
                         help="comma-separated languages, e.g. ukrainian,german (default: all)")
     parser.add_argument("--rerun", action="store_true",
                         help="generate: regenerate local results that aren't uploaded yet")
-    parser.add_argument("--source", choices=["local", "hf"], default="local",
-                        help="select: read results from results/ (local) or the HF repo (hf)")
     parser.add_argument("--worker", help=argparse.SUPPRESS)
     parser.add_argument("--gpus", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--langs", help=argparse.SUPPRESS)
